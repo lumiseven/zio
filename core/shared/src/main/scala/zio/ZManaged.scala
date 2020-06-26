@@ -406,10 +406,10 @@ final class ZManaged[-R, +E, +A] private (val zio: ZIO[(R, ZManaged.ReleaseMap),
     }
 
   /**
-   * Unwraps the optional success of this effect, but can fail with unit value.
+   * Unwraps the optional success of this effect, but can fail with None value.
    */
-  def get[B](implicit ev1: E <:< Nothing, ev2: A <:< Option[B]): ZManaged[R, Unit, B] =
-    ZManaged.absolve(mapError(ev1)(CanFail).map(ev2(_).toRight(())))
+  def get[B](implicit ev1: E <:< Nothing, ev2: A <:< Option[B]): ZManaged[R, Option[Nothing], B] =
+    ZManaged.absolve(mapError(ev1)(CanFail).map(ev2(_).toRight(None)))
 
   /**
    * Returns a new effect that ignores the success or failure of this effect.
@@ -986,6 +986,12 @@ final class ZManaged[-R, +E, +A] private (val zio: ZIO[(R, ZManaged.ReleaseMap),
     ZManaged.unsandbox(mapError(ev))
 
   /**
+   * Updates a service in the environment of this effect.
+   */
+  final def updateService[M] =
+    new ZManaged.UpdateService[R, E, A, M](self)
+
+  /**
    * Run an effect while acquiring the resource before and releasing it after
    */
   def use[R1 <: R, E1 >: E, B](f: A => ZIO[R1, E1, B]): ZIO[R1, E1, B] =
@@ -1150,6 +1156,11 @@ object ZManaged {
   final class UnlessM[R, E](private val b: ZManaged[R, E, Boolean]) extends AnyVal {
     def apply[R1 <: R, E1 >: E](managed: => ZManaged[R1, E1, Any]): ZManaged[R1, E1, Unit] =
       b.flatMap(b => if (b) unit else managed.unit)
+  }
+
+  final class UpdateService[-R, +E, +A, M](private val self: ZManaged[R, E, A]) extends AnyVal {
+    def apply[R1 <: R with Has[M]](f: M => M)(implicit ev: Has.IsHas[R1], tag: Tag[M]): ZManaged[R1, E, A] =
+      self.provideSome(ev.update(_, f))
   }
 
   final class WhenM[R, E](private val b: ZManaged[R, E, Boolean]) extends AnyVal {
@@ -2253,6 +2264,19 @@ object ZManaged {
    */
   def whenM[R, E](b: ZManaged[R, E, Boolean]): ZManaged.WhenM[R, E] =
     new ZManaged.WhenM(b)
+
+  /**
+   * Locally installs a supervisor and an effect that succeeds with all the
+   * children that have been forked in the returned effect.
+   */
+  def withChildren[R, E, A](get: UIO[Chunk[Fiber.Runtime[Any, Any]]] => ZManaged[R, E, A]): ZManaged[R, E, A] =
+    ZManaged.unwrap(Supervisor.track(true).map { supervisor =>
+      // Filter out the fiber id of whoever is calling this:
+      ZManaged(
+        get(supervisor.value.flatMap(children => ZIO.descriptor.map(d => children.filter(_.id != d.id)))).zio
+          .supervised(supervisor)
+      )
+    })
 
   private[zio] def succeedNow[A](r: A): ZManaged[Any, Nothing, A] =
     ZManaged(IO.succeedNow((Finalizer.noop, r)))

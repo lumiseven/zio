@@ -1,6 +1,7 @@
 package zio.stream
 
 import java.io.ByteArrayInputStream
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 import scala.concurrent.ExecutionContext
@@ -1148,7 +1149,7 @@ object ZStreamSpec extends ZIOBaseSpec {
                          .either
               cancelled <- substreamCancelled.get
             } yield assert(cancelled)(isTrue) && assert(result)(isLeft(equalTo("Ouch")))
-          },
+          } @@ nonFlaky,
           testM("inner defects interrupt all fibers") {
             val ex = new RuntimeException("Ouch")
 
@@ -1180,7 +1181,7 @@ object ZStreamSpec extends ZIOBaseSpec {
                          .run
               cancelled <- substreamCancelled.get
             } yield assert(cancelled)(isTrue) && assert(result)(dies(equalTo(ex)))
-          },
+          } @@ nonFlaky,
           testM("finalizer ordering") {
             for {
               execution <- Ref.make[List[String]](Nil)
@@ -1283,7 +1284,7 @@ object ZStreamSpec extends ZIOBaseSpec {
                          .either
               cancelled <- substreamCancelled.get
             } yield assert(cancelled)(isTrue) && assert(result)(isLeft(equalTo("Ouch")))
-          },
+          } @@ nonFlaky,
           testM("inner defects interrupt all fibers") {
             val ex = new RuntimeException("Ouch")
 
@@ -1315,7 +1316,7 @@ object ZStreamSpec extends ZIOBaseSpec {
                          .run
               cancelled <- substreamCancelled.get
             } yield assert(cancelled)(isTrue) && assert(result)(dies(equalTo(ex)))
-          },
+          } @@ nonFlaky,
           testM("finalizer ordering") {
             for {
               execution <- Ref.make(List.empty[String])
@@ -1540,8 +1541,13 @@ object ZStreamSpec extends ZIOBaseSpec {
             } yield assert(result)(equalTo(Chunk(1)))
           }
         ),
-        testM("grouped")(
-          assertM(ZStream(1, 2, 3, 4).grouped(2).runCollect)(equalTo(Chunk(List(1, 2), List(3, 4))))
+        suite("grouped")(
+          testM("sanity") {
+            assertM(ZStream(1, 2, 3, 4, 5).grouped(2).runCollect)(equalTo(Chunk(List(1, 2), List(3, 4), List(5))))
+          },
+          testM("doesn't emit empty chunks") {
+            assertM(ZStream.fromIterable(List.empty[Int]).grouped(5).runCollect)(equalTo(Chunk.empty))
+          }
         ),
         suite("groupedWithin")(
           testM("group based on time passed") {
@@ -1913,7 +1919,7 @@ object ZStreamSpec extends ZIOBaseSpec {
         ),
         suite("mapMPar")(
           testM("foreachParN equivalence") {
-            checkM(Gen.small(Gen.listOfN(_)(Gen.anyByte)), Gen.function(Gen.successes(Gen.anyByte))) { (data, f) =>
+            checkNM(10)(Gen.small(Gen.listOfN(_)(Gen.anyByte)), Gen.function(Gen.successes(Gen.anyByte))) { (data, f) =>
               val s = ZStream.fromIterable(data)
 
               for {
@@ -2836,6 +2842,130 @@ object ZStreamSpec extends ZIOBaseSpec {
             )
           })
         ),
+        suite("toReader")(
+          testM("read one-by-one") {
+            checkM(tinyListOf(Gen.chunkOf(Gen.anyChar))) { chunks =>
+              val content = chunks.flatMap(_.toList)
+              ZStream.fromChunks(chunks: _*).toReader.use[Any, Throwable, TestResult] { reader =>
+                ZIO.succeedNow(
+                  assert(Iterator.continually(reader.read()).takeWhile(_ != -1).map(_.toChar).toList)(
+                    equalTo(content)
+                  )
+                )
+              }
+            }
+          },
+          testM("read in batches") {
+            checkM(tinyListOf(Gen.chunkOf(Gen.anyChar))) {
+              chunks =>
+                val content = chunks.flatMap(_.toList)
+                ZStream.fromChunks(chunks: _*).toReader.use[Any, Throwable, TestResult] { reader =>
+                  val batches: List[(Array[Char], Int)] = Iterator.continually {
+                    val buf = new Array[Char](10)
+                    val res = reader.read(buf, 0, 4)
+                    (buf, res)
+                  }.takeWhile(_._2 != -1).toList
+                  val combined = batches.flatMap { case (buf, size) => buf.take(size) }
+                  ZIO.succeedNow(assert(combined)(equalTo(content)))
+                }
+            }
+          },
+          testM("Throws mark not supported") {
+            assertM(
+              ZStream
+                .fromChunk(Chunk.fromArray("Lorem ipsum".toArray))
+                .toReader
+                .use(reader =>
+                  Task {
+                    reader.mark(0)
+                  }
+                )
+                .run
+            )(fails(isSubtype[IOException](anything)))
+          },
+          testM("Throws reset not supported") {
+            assertM(
+              ZStream
+                .fromChunk(Chunk.fromArray("Lorem ipsum".toArray))
+                .toReader
+                .use(reader =>
+                  Task {
+                    reader.reset()
+                  }
+                )
+                .run
+            )(fails(isSubtype[IOException](anything)))
+          },
+          testM("Does not support mark") {
+            assertM(
+              ZStream
+                .fromChunk(Chunk.fromArray("Lorem ipsum".toArray))
+                .toReader
+                .use(reader => ZIO.succeed(reader.markSupported()))
+            )(equalTo(false))
+          },
+          testM("Ready is false") {
+            assertM(
+              ZStream
+                .fromChunk(Chunk.fromArray("Lorem ipsum".toArray))
+                .toReader
+                .use(reader => ZIO.succeed(reader.ready()))
+            )(equalTo(false))
+          },
+          testM("Preserves errors") {
+            assertM(
+              ZStream
+                .fail(new Exception("boom"))
+                .toReader
+                .use(reader =>
+                  Task {
+                    reader.read
+                  }
+                )
+                .run
+            )(
+              fails(hasMessage(equalTo("boom")))
+            )
+          },
+          testM("Be completely lazy") {
+            assertM(
+              ZStream
+                .fail(new Exception("boom"))
+                .toReader
+                .use(_ => ZIO.succeed("ok"))
+            )(equalTo("ok"))
+          },
+          testM("Preserves errors in the middle") {
+            val chars: Seq[Char] = (1 to 5).map(_.toChar)
+            val str: ZStream[Any, Throwable, Char] =
+              ZStream.fromIterable(chars) ++ ZStream.fail(new Exception("boom"))
+            assertM(
+              str.toReader
+                .use(reader =>
+                  Task {
+                    val buf = new Array[Char](50)
+                    reader.read(buf)
+                    "ok"
+                  }
+                )
+                .run
+            )(fails(hasMessage(equalTo("boom"))))
+          },
+          testM("Allows reading something even in case of error") {
+            val chars: Seq[Char] = (1 to 5).map(_.toChar)
+            val str: ZStream[Any, Throwable, Char] =
+              ZStream.fromIterable(chars) ++ ZStream.fail(new Exception("boom"))
+            assertM(
+              str.toReader.use(reader =>
+                Task {
+                  val buf = new Array[Char](5)
+                  reader.read(buf)
+                  buf.toList
+                }
+              )
+            )(equalTo(chars))
+          }
+        ),
         suite("zipWith")(
           testM("zip doesn't pull too much when one of the streams is done") {
             val l = ZStream.fromChunks(Chunk(1, 2), Chunk(3, 4), Chunk(5)) ++ ZStream.fail(
@@ -3286,7 +3416,11 @@ object ZStreamSpec extends ZIOBaseSpec {
           )(equalTo(Chunk(0, 1, 2, 3)))
         },
         testM("range") {
-          assertM(ZStream.range(0, 10).runCollect)(equalTo(Chunk.fromIterable(Range(0, 10))))
+          val right = Chunk.fromIterable(Range(0, 10))
+          println(right)
+          val left = UIO(println("Starting")) *> ZStream.range(0, 10).runCollect <* UIO(println("Done"))
+          assertM(left)(equalTo(right))
+          //assertM(ZStream.range(0, 10).runCollect)(equalTo(Chunk.fromIterable(Range(0, 10))))
         },
         testM("repeatEffect")(
           assertM(
